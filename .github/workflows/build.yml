@@ -1,0 +1,71 @@
+name: Build Windows EXE (Nuitka)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka
+
+      - name: Cache Nuitka build
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/
+            .nuitka/
+          key: nuitka-${{ runner.os }}-${{ hashFiles('requirements.txt', 'src/**/*.py') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-
+
+      - name: Build EXE with Nuitka
+        run: |
+          python -m nuitka `
+            --standalone `
+            --onefile `
+            --windows-icon-from-ico=assets/typhoon.ico `
+            --windows-console-mode=force `
+            --include-package=sounddevice `
+            --include-package=cv2 `
+            --include-package=psutil `
+            --include-package=pygetwindow `
+            --include-package=scipy `
+            --include-package=mss `
+            --include-package-data=sounddevice `
+            --include-package-data=scipy `
+            --include-package-data=numpy `
+            --enable-plugin=numpy `
+            --lto=yes `
+            --jobs=4 `
+            --output-dir=dist `
+            --output-filename=typhoon.exe `
+            src/main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typhoon-nuitka-win64
+          path: dist/typhoon.exe
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/typhoon.exe
+          generate_release_notes: true
