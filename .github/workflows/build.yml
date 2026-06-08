@@ -50,9 +50,6 @@ jobs:
             --include-package=pygetwindow `
             --include-package=scipy `
             --include-package=mss `
-            --include-package-data=sounddevice `
-            --include-package-data=scipy `
-            --include-package-data=numpy `
             --lto=yes `
             --jobs=4 `
             --output-dir=dist `
