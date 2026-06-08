@@ -3,12 +3,12 @@ mss==10.2.0
 numpy==2.4.6
 opencv-python==4.13.0.92
 packaging==26.0
-pip==26.1.1
+# pip==26.1.1
 psutil==7.2.2
 pycparser==3.0
 PyGetWindow==0.0.9
 PyRect==0.2.0
 scipy==1.17.1
-setuptools==82.0.1
+# setuptools==82.0.1
 sounddevice==0.5.5
-wheel==0.46.3
+# wheel==0.46.3
