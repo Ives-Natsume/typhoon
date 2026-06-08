@@ -50,6 +50,7 @@ jobs:
             --include-package=pygetwindow `
             --include-package=scipy `
             --include-package=mss `
+            --assume-yes-for-downloads `
             --lto=yes `
             --jobs=4 `
             --output-dir=dist `
