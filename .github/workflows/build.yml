@@ -55,7 +55,7 @@ jobs:
             --jobs=4 `
             --output-dir=dist `
             --output-filename=typhoon.exe `
-            src/main.py
+            main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
