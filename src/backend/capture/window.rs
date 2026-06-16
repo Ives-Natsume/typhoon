@@ -34,14 +34,14 @@ impl GraphicsCaptureApiHandler for WindowHandler {
     fn on_frame_arrived(
         &mut self,
         frame: &mut Frame,
-        capture_control: InternalCaptureControl,
+        _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
         if !self.saved {
             frame.save_as_image(&self.filename, ImageFormat::Png)?;
             tracing::info!("Screenshot saved: {}", self.filename);
             self.saved = true;
 
-            capture_control.stop();
+            _capture_control.stop();
         }
 
         Ok(())
