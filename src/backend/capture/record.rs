@@ -11,20 +11,16 @@ use windows_capture::{
     },
 };
 use std::{
-    process::{Command, Stdio},
-    io::Write,
-    path::{Path, PathBuf},
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, sync::Arc, thread::JoinHandle, time::{Duration, Instant}
 };
 use crate::{
-    utils::config,
+    util::config,
     backend::capture::window::window_detect,
 };
 
 #[derive(Clone)]
 pub struct FrameChunk {
-    pub data: Vec<u8>,      // raw frame data
+    pub data: Arc<[u8]>,
     pub width: u32,
     pub height: u32,
     pub timestamp: Instant,
@@ -137,7 +133,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     ) -> Result<(), Self::Error> {
         let mut buffer = frame.buffer()?;
         let chunk = FrameChunk {
-            data: buffer.as_raw_buffer().to_vec(),
+            data: Arc::from(buffer.as_raw_buffer().to_vec().into_boxed_slice()),
             width: frame.width(),
             height: frame.height(),
             timestamp: Instant::now(),

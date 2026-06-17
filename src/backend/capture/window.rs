@@ -12,7 +12,7 @@ use windows_capture::{
         DirtyRegionSettings
     },
 };
-use crate::utils::config;
+use crate::util::config;
 
 /// Window information for display purposes
 pub struct WindowHandler {
@@ -54,9 +54,9 @@ impl GraphicsCaptureApiHandler for WindowHandler {
 }
 
 pub fn window_detect(
-    process_name: &str,
+    keyword: &str,
 ) -> Result<Window> {
-    let target_window = Window::from_contains_name(process_name);
+    let target_window = Window::from_contains_name(keyword);
     match target_window {
         Ok(window) => Ok(window),
         Err(_) => Err(anyhow::anyhow!("No target window found")),
@@ -100,4 +100,20 @@ fn _sanitize_filename(name: &str) -> String {
 fn _match_keyword(keyword: &str, win_title: &str, app_name: &str) -> bool {
     let keyword = keyword.to_lowercase();
     win_title.to_lowercase().contains(&keyword) || app_name.to_lowercase().contains(&keyword)
+}
+
+pub struct GameMonitorService;
+
+impl GameMonitorService {
+    pub fn detect_game(
+        keyword: &str
+    ) -> Result<()> {
+        let result = window_detect(keyword);
+        match result {
+            Ok(_) => {
+                Ok(())
+            },
+            Err(e) => Err(anyhow::anyhow!("Failed to detect target window: {}", e)),
+        }
+    }
 }
