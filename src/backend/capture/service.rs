@@ -28,8 +28,18 @@ impl Service for CaptureService {
         if self.recorder.is_some() {
             return Ok(());
         }
-        self.recorder = Some(Recorder::start().await?);
-        Ok(())
+
+        let recorder = Recorder::start().await;
+        match recorder {
+            Ok(r) => {
+                self.recorder = Some(r);
+                return Ok(())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to start recorder");
+                return Err(e)
+            }
+        };
     }
 
     async fn stop(&mut self) -> Result<()> {

@@ -4,7 +4,7 @@
 
 对不起我只坚持了2个commit，天哪opus4.8 max大人
 
-隔壁MAA的PC端太难用了，生息演算都没法刷
+~~隔壁MAA的PC端太难用了，生息演算都没法刷~~
 
 ## Requirements
 

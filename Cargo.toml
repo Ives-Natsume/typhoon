@@ -9,7 +9,9 @@ async-trait = "0.1.89"
 chrono = "0.4.45"
 crossbeam-channel = "0.5.15"
 enigo = "0.6.1"
+flexaudio = "0.2.0"
 image = "0.25.10"
+oar-ocr = "0.6.3"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"

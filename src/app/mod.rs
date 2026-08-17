@@ -12,21 +12,50 @@ use self::{
 use async_trait::async_trait;
 use anyhow::Result;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 pub struct AppContext {
-    pub game_state: Arc<GameState>,
+    /// Single source of truth for the high-level game state. Perception
+    /// services publish transitions here; consumers take their own receiver via
+    /// [`AppContext::subscribe_state`] and react on change.
+    state_tx: watch::Sender<GameState>,
     pub task_manager: Arc<TaskManager>,
 }
 
 impl AppContext {
     pub async fn new() -> Result<Self> {
-        let game_state = Arc::new(GameState::NotStarted);
+        let (state_tx, _state_rx) = watch::channel(GameState::default());
         let task_manager = Arc::new(TaskManager::new());
 
         Ok(Self {
-            game_state,
+            state_tx,
             task_manager,
         })
+    }
+
+    /// Publish a game state. Receivers are only woken when the value actually
+    /// changes, so `changed()` downstream fires once per real transition.
+    pub fn set_state(&self, state: GameState) {
+        self.state_tx.send_if_modified(|current| {
+            if *current == state {
+                return false;
+            }
+            let previous = *current;
+            *current = state;
+            tracing::info!(from = ?previous, to = ?state, "game state transition");
+            true
+        });
+    }
+
+    /// Cheap snapshot of the current game state.
+    pub fn state(&self) -> GameState {
+        *self.state_tx.borrow()
+    }
+
+    /// Subscribe to state changes. Each consumer owns its own receiver and
+    /// awaits `Receiver::changed`.
+    pub fn subscribe_state(&self) -> watch::Receiver<GameState> {
+        self.state_tx.subscribe()
     }
 }
 

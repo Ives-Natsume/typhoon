@@ -14,8 +14,11 @@ use std::{
     io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, sync::Arc, thread::JoinHandle, time::{Duration, Instant}
 };
 use crate::{
+    backend::capture::{
+        audio::{AudioRecorder, AudioTrack},
+        window::window_detect,
+    },
     util::config,
-    backend::capture::window::window_detect,
 };
 
 #[derive(Clone)]
@@ -28,10 +31,20 @@ pub struct FrameChunk {
 
 type CaptureError = Box<dyn std::error::Error + Send + Sync>;
 
+/// What the encoder thread produces once the video side has been finalized.
+struct VideoOutput {
+    /// Video-only file (no audio track yet).
+    path: PathBuf,
+    /// Wall-clock instant that presentation time 0 of `path` corresponds to.
+    start: Instant,
+}
+
 pub struct Recorder {
     shutdown_tx: Sender<()>,
     capture_control: CaptureControl<CaptureHandler, CaptureError>,
-    encoder_handle: JoinHandle<()>,
+    encoder_handle: JoinHandle<Option<VideoOutput>>,
+    audio: Option<AudioRecorder>,
+    final_output: PathBuf,
 }
 
 impl Recorder {
@@ -64,6 +77,32 @@ impl Recorder {
             }
         };
 
+        // WASAPI process loopback is selected by PID, not HWND. The window we
+        // capture video from gives us the PID for free, so both halves of the
+        // recording target the exact same process tree.
+        let target_pid = match target_window.process_id() {
+            Ok(pid) => Some(pid),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not resolve target PID; audio will use global loopback");
+                None
+            }
+        };
+
+        // Start audio BEFORE video: audio needs a moment to activate the WASAPI
+        // client, and a slightly early audio origin is trimmed during alignment
+        // whereas a late one costs us the first frames of sound.
+        let audio = if config.capture.audio {
+            match AudioRecorder::start(target_pid, record_duration) {
+                Ok(rec) => Some(rec),
+                Err(e) => {
+                    tracing::error!(error = %e, "audio capture disabled: failed to start");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let settings = Settings::new(
             target_window,
             // Default cursor capture settings (capture the cursor)
@@ -81,18 +120,28 @@ impl Recorder {
             capture_tx,
         );
 
+        let final_output = Path::new(&output_dir).join("recording.mp4");
+
         let encoder_handle = std::thread::spawn(move || {
-            if let Err(e) =
-                ffmpeg_encoder_thread(capture_rx, shutdown_rx, &output_dir, fps, record_duration)
-            {
-                tracing::error!("FFmpeg encoder thread error: {}", e);
+            match ffmpeg_encoder_thread(capture_rx, shutdown_rx, &output_dir, fps, record_duration) {
+                Ok(out) => out,
+                Err(e) => {
+                    tracing::error!("FFmpeg encoder thread error: {}", e);
+                    None
+                }
             }
         });
 
         let capture_control = CaptureHandler::start_free_threaded(settings)
             .map_err(|e| anyhow::anyhow!("Failed to start capture: {}", e))?;
 
-        Ok(Self { shutdown_tx, capture_control, encoder_handle })
+        Ok(Self {
+            shutdown_tx,
+            capture_control,
+            encoder_handle,
+            audio,
+            final_output,
+        })
     }
 
     pub fn stop(self) -> anyhow::Result<()> {
@@ -106,12 +155,96 @@ impl Recorder {
         let _ = self.shutdown_tx.send(());
 
         // Wait for FFmpeg to flush and write the MP4 trailer.
-        self.encoder_handle
+        let video = self
+            .encoder_handle
             .join()
             .map_err(|_| anyhow::anyhow!("Encoder thread panicked"))?;
 
+        // Stop audio only after the video side is finalized so the retained
+        // audio window covers the very end of the footage too.
+        let audio_track = self.audio.and_then(|a| a.stop());
+
+        match (video, audio_track) {
+            (Some(video), Some(track)) => {
+                if let Err(e) = mux_audio(&video, &track, &self.final_output) {
+                    tracing::error!("Failed to mux audio: {}; keeping video-only output", e);
+                    promote_video_only(&video.path, &self.final_output);
+                }
+            }
+            (Some(video), None) => promote_video_only(&video.path, &self.final_output),
+            (None, _) => tracing::warn!("No video was produced; nothing to finalize"),
+        }
+
         Ok(())
     }
+}
+
+/// Moves the video-only file into place when there is no audio to merge.
+fn promote_video_only(video: &Path, final_output: &Path) {
+    if video == final_output {
+        return;
+    }
+    let _ = std::fs::remove_file(final_output);
+    if let Err(e) = std::fs::rename(video, final_output) {
+        tracing::error!("Failed to move {} to {}: {}", video.display(), final_output.display(), e);
+    } else {
+        tracing::info!("Recording written to {}", final_output.display());
+    }
+}
+
+/// Merges the captured audio track into the video, aligned on the shared
+/// monotonic clock.
+///
+/// The alignment itself happens while writing the WAV (silence padding /
+/// trimming in the sample domain), so ffmpeg only has to mux two streams that
+/// already start at the same instant. Video is stream-copied; only audio is
+/// encoded.
+fn mux_audio(video: &VideoOutput, track: &AudioTrack, final_output: &Path) -> anyhow::Result<()> {
+    let wav_path = video.path.with_extension("wav");
+    track.write_wav_aligned(&wav_path, video.start)?;
+
+    let tmp_output = final_output.with_extension("muxing.mp4");
+    let result = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i", video.path.to_string_lossy().as_ref(),
+            "-i", wav_path.to_string_lossy().as_ref(),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            // Both inputs already share t=0; cut at whichever ends first so the
+            // trailing silence/black does not extend the file.
+            "-shortest",
+            "-movflags", "+faststart",
+            tmp_output.to_string_lossy().as_ref(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let _ = std::fs::remove_file(&wav_path);
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let _ = std::fs::remove_file(&tmp_output);
+        return Err(anyhow::anyhow!(
+            "ffmpeg mux failed ({}): {}",
+            result.status,
+            stderr.lines().last().unwrap_or("unknown error")
+        ));
+    }
+
+    let _ = std::fs::remove_file(final_output);
+    std::fs::rename(&tmp_output, final_output)?;
+    let _ = std::fs::remove_file(&video.path);
+    tracing::info!(
+        audio_secs = track.duration().as_secs_f32(),
+        "Recording with audio written to {}",
+        final_output.display()
+    );
+    Ok(())
 }
 
 struct CaptureHandler {
@@ -162,17 +295,21 @@ fn ffmpeg_encoder_thread(
     output_dir: &str,
     fps: u32,
     duration_secs: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<VideoOutput>> {
     // Block until the first frame so the real capture dimensions are known.
     let first_frame = match rx.recv() {
         Ok(frame) => frame,
         Err(_) => {
             tracing::warn!("Capture ended before any frame arrived; nothing to encode");
-            return Ok(());
+            return Ok(None);
         }
     };
     let width = first_frame.width;
     let height = first_frame.height;
+    // Wall-clock time of the first encoded frame. Frames are fed to ffmpeg at a
+    // constant `-r`, so presentation time 0 of the merged video corresponds to
+    // this instant (adjusted below for the segments dropped by pruning).
+    let first_frame_instant = first_frame.timestamp;
 
     // Pre-record ring buffer parameters.
     //
@@ -189,8 +326,9 @@ fn ffmpeg_encoder_thread(
     let segments_dir = Path::new(output_dir).join(format!(".segments_{timestamp}"));
     std::fs::create_dir_all(&segments_dir)?;
     let segment_pattern = segments_dir.join("segment_%05d.mp4");
-    // let final_output = Path::new(output_dir).join(format!("recording_{timestamp}.mp4"));
-    let final_output = Path::new(output_dir).join("recording.mp4");
+    // Video-only intermediate; `Recorder::stop` either muxes audio into the
+    // real output or renames this file into place.
+    let video_only = Path::new(output_dir).join(format!(".video_{timestamp}.mp4"));
 
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
@@ -236,19 +374,55 @@ fn ffmpeg_encoder_thread(
     // already throttled to the target FPS and FFmpeg paces the output via the
     // "-r" flag, so the consumer must NOT sleep here: throttling the consumer
     // would back the ring buffer up and drop frames.
+    //
+    // CONSTANT FRAME RATE PACING (required for A/V sync)
+    //
+    // The Windows capture API only emits a frame when the window actually
+    // changes, so a mostly-static screen yields FEWER frames than `fps *
+    // elapsed`. Because ffmpeg is told `-r <fps>`, every frame we hand over
+    // occupies exactly 1/fps of video timeline: feeding it 27 fps worth of
+    // frames while 30 fps worth of wall-clock time passes makes the video
+    // timeline drift SLOWER than reality (a 1195 s session became 1079 s of
+    // video, i.e. ~10% time compression).
+    //
+    // That breaks two things at once: playback speed, and any attempt to map a
+    // video timestamp back to a wall-clock instant (which is what audio
+    // alignment needs). So we duplicate the previous frame into every slot the
+    // capture API skipped, turning the stream into true CFR anchored to the
+    // wall clock. Duplicated frames of a static screen cost x264 almost nothing
+    // (they encode as near-empty P-frames).
     let mut frame_count: u64 = 0;
+    let mut duplicated: u64 = 0;
     let mut last_cleanup = Instant::now();
+    let mut last_data: Arc<[u8]> = first_frame.data.clone();
+
+    // How many frame slots should be filled by the time `t` is reached.
+    let slot_at = |t: Instant| -> u64 {
+        (t.saturating_duration_since(first_frame_instant).as_secs_f64() * fps as f64).round() as u64
+    };
+
     match stdin.write_all(&first_frame.data) {
         Ok(()) => {
             frame_count += 1;
             loop {
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(chunk) => {
+                        // Fill the gap between the last written slot and this
+                        // frame's real arrival time, then write the frame.
+                        match pad_frames(&mut stdin, &last_data, &mut frame_count, slot_at(chunk.timestamp)) {
+                            Ok(n) => duplicated += n,
+                            Err(e) => {
+                                tracing::error!("Failed to pad frames to FFmpeg: {}", e);
+                                break;
+                            }
+                        }
+
                         if let Err(e) = stdin.write_all(&chunk.data) {
                             tracing::error!("Failed to write frame to FFmpeg: {}", e);
                             break;
                         }
                         frame_count += 1;
+                        last_data = chunk.data;
 
                         // flush every 30 frames
                         if frame_count % 30 == 0 {
@@ -256,6 +430,17 @@ fn ffmpeg_encoder_thread(
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // Nothing changed on screen; keep the video timeline
+                        // moving so it stays locked to the wall clock.
+                        match pad_frames(&mut stdin, &last_data, &mut frame_count, slot_at(Instant::now())) {
+                            Ok(n) => duplicated += n,
+                            Err(e) => {
+                                tracing::error!("Failed to pad frames to FFmpeg: {}", e);
+                                break;
+                            }
+                        }
+                        let _ = stdin.flush();
+
                         if shutdown_rx.try_recv().is_ok() {
                             tracing::info!("Shutdown signal received, finalizing recording");
                             break;
@@ -285,26 +470,77 @@ fn ffmpeg_encoder_thread(
     drop(stdin); // EOF: FFmpeg flushes buffers and finalizes the last segment.
     let status = ffmpeg.wait()?;
     let _ = stderr_thread.join();
-    tracing::info!("FFmpeg segmenting finished: {} ({} frames)", status, frame_count);
+    tracing::info!(
+        "FFmpeg segmenting finished: {} ({} frames, {} duplicated for CFR, {:.1}s of video)",
+        status,
+        frame_count,
+        duplicated,
+        frame_count as f64 / fps as f64
+    );
 
     // Trim once more so the retained footage stays close to `duration_secs`.
     if let Err(e) = prune_old_segments(&segments_dir, keep_segments) {
         tracing::warn!("Failed to prune old segments: {}", e);
     }
 
+    // Pruning drops the oldest segments, so the merged video no longer starts at
+    // the first captured frame. The surviving set begins at
+    // `first_segment_index * segment_seconds` on the original timeline, which is
+    // exactly the shift the audio track must be aligned against.
+    let first_index = list_segments(&segments_dir)
+        .map(|s| s.first().map(|(i, _)| *i).unwrap_or(0))
+        .unwrap_or(0);
+    let video_start =
+        first_frame_instant + Duration::from_secs(first_index as u64 * segment_seconds as u64);
+
     // Merge the surviving segments (in chronological order) into the final
     // output file, then remove the temporary segment directory.
-    match concat_segments(&segments_dir, &final_output) {
-        Ok(0) => tracing::warn!("No segments were produced; nothing to merge"),
-        Ok(n) => tracing::info!("Merged {} segment(s) into {}", n, final_output.display()),
-        Err(e) => tracing::error!("Failed to merge segments: {}", e),
-    }
+    let merged = match concat_segments(&segments_dir, &video_only) {
+        Ok(0) => {
+            tracing::warn!("No segments were produced; nothing to merge");
+            false
+        }
+        Ok(n) => {
+            tracing::info!("Merged {} segment(s) into {}", n, video_only.display());
+            true
+        }
+        Err(e) => {
+            tracing::error!("Failed to merge segments: {}", e);
+            false
+        }
+    };
 
     if let Err(e) = std::fs::remove_dir_all(&segments_dir) {
         tracing::warn!("Failed to remove temporary segment directory: {}", e);
     }
 
-    Ok(())
+    Ok(merged.then_some(VideoOutput {
+        path: video_only,
+        start: video_start,
+    }))
+}
+
+/// Repeats `last` until `frame_count` reaches `target_slot`, keeping the video
+/// timeline locked to the wall clock when the capture API emits no frames.
+///
+/// Returns how many duplicate frames were written. The per-call fill is capped
+/// so a long stall (window minimised, machine suspended) cannot blow up into a
+/// huge synchronous write burst.
+fn pad_frames(
+    stdin: &mut impl Write,
+    last: &[u8],
+    frame_count: &mut u64,
+    target_slot: u64,
+) -> std::io::Result<u64> {
+    if target_slot <= *frame_count {
+        return Ok(0);
+    }
+    let missing = (target_slot - *frame_count).min(600); // <= 20 s at 30 fps
+    for _ in 0..missing {
+        stdin.write_all(last)?;
+        *frame_count += 1;
+    }
+    Ok(missing)
 }
 
 /// Lists the segment files in `dir`, sorted ascending by their numeric index

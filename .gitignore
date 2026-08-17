@@ -1,4 +1,5 @@
 /target
 /output
 /logs
+/assets
 config.toml
